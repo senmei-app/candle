@@ -63,8 +63,11 @@ pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
+pub mod dummy_hip_backend;
 mod dummy_metal_backend;
 pub mod error;
+#[cfg(feature = "rocm")]
+pub mod hip_backend;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
@@ -117,6 +120,14 @@ pub use cuda_backend as cuda;
 pub use dummy_cuda_backend as cuda;
 
 pub use cuda::{CudaDevice, CudaStorage};
+
+#[cfg(feature = "rocm")]
+pub use hip_backend as hip;
+
+#[cfg(not(feature = "rocm"))]
+pub use dummy_hip_backend as hip;
+
+pub use hip::{HipDevice, HipStorage};
 
 #[cfg(feature = "metal")]
 pub use metal_backend::{MetalDevice, MetalError, MetalStorage};

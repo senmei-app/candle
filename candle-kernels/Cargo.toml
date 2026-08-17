@@ -11,5 +11,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 
+[features]
+# Build the kernels for AMD ROCm/HIP (via hipcc) instead of CUDA/PTX.
+rocm = []
+
 [build-dependencies]
 cudaforge = "0.1.2"

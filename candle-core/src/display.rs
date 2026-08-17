@@ -17,8 +17,9 @@ impl Tensor {
             }
             crate::DeviceLocation::Metal { gpu_id } => {
                 format!(", metal:{gpu_id}")
-            }
-        };
+            }            crate::DeviceLocation::Hip { gpu_id } => {
+                format!(", hip:{gpu_id}")
+            }        };
 
         write!(f, "Tensor[")?;
         match self.dims() {
@@ -544,6 +545,9 @@ impl std::fmt::Display for Tensor {
             }
             crate::DeviceLocation::Metal { gpu_id } => {
                 format!(", metal:{gpu_id}")
+            }
+            crate::DeviceLocation::Hip { gpu_id } => {
+                format!(", hip:{gpu_id}")
             }
         };
 

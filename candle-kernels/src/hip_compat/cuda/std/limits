@@ -1,0 +1,39 @@
+// Minimal `cuda::std::numeric_limits` shim for the HIP build.
+// The full libhipcxx <cuda/std/limits> header produces code objects that crash
+// when loaded via hipModuleLoadData, so only the integer specializations used by
+// candle's reduce kernel are provided here.
+#pragma once
+#include <climits>
+#include <cstdint>
+
+namespace cuda {
+namespace std {
+template <typename T>
+struct numeric_limits {
+    static constexpr T lowest() { return T(); }
+    static constexpr T max() { return T(); }
+    static constexpr T min() { return T(); }
+};
+
+template <>
+struct numeric_limits<int64_t> {
+    static constexpr int64_t lowest() { return INT64_MIN; }
+    static constexpr int64_t max() { return INT64_MAX; }
+    static constexpr int64_t min() { return INT64_MIN; }
+};
+
+template <>
+struct numeric_limits<uint32_t> {
+    static constexpr uint32_t lowest() { return 0; }
+    static constexpr uint32_t max() { return UINT32_MAX; }
+    static constexpr uint32_t min() { return 0; }
+};
+
+template <>
+struct numeric_limits<uint8_t> {
+    static constexpr uint8_t lowest() { return 0; }
+    static constexpr uint8_t max() { return UINT8_MAX; }
+    static constexpr uint8_t min() { return 0; }
+};
+}  // namespace std
+}  // namespace cuda
