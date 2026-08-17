@@ -34,6 +34,14 @@ pub struct HipStorage {
     pub device: HipDevice,
 }
 
+// rocm-rs DeviceMemory wraps a raw pointer and isn't Send/Sync by default;
+// device memory handles are thread-safe here (candle synchronizes before use).
+// Mirrors the CUDA backend.
+unsafe impl Send for HipStorageSlice {}
+unsafe impl Sync for HipStorageSlice {}
+unsafe impl Send for HipStorage {}
+unsafe impl Sync for HipStorage {}
+
 impl std::fmt::Debug for HipStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "HipStorage")
@@ -798,10 +806,51 @@ impl BackendStorage for HipStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
-        let mut dst_cpu = dst.to_cpu_storage()?;
-        let src_cpu = self.to_cpu_storage()?;
-        src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
-        *dst = self.device.storage_from_cpu_storage(&dst_cpu)?;
+        let el_count = src_l.shape().elem_count();
+        if el_count == 0 {
+            return Ok(());
+        }
+        let dev = &self.device;
+        let info = if src_l.is_contiguous() {
+            InfoArg::Null
+        } else {
+            InfoArg::Ptr(dev.copy_htod(&[src_l.dims(), src_l.stride()].concat())?)
+        };
+        match (&self.slice, &mut dst.slice) {
+            (S::U8(s), S::U8(d)) => copy_strided_run::<u8>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_u8",
+            )?,
+            (S::U32(s), S::U32(d)) => copy_strided_run::<u32>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_u32",
+            )?,
+            (S::I32(s), S::I32(d)) => copy_strided_run::<i32>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_i32",
+            )?,
+            (S::I64(s), S::I64(d)) => copy_strided_run::<i64>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_i64",
+            )?,
+            (S::BF16(s), S::BF16(d)) => copy_strided_run::<bf16>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_bf16",
+            )?,
+            (S::F16(s), S::F16(d)) => copy_strided_run::<f16>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_f16",
+            )?,
+            (S::F32(s), S::F32(d)) => copy_strided_run::<f32>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_f32",
+            )?,
+            (S::F64(s), S::F64(d)) => copy_strided_run::<f64>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_f64",
+            )?,
+            (S::F8E4M3(s), S::F8E4M3(d)) => copy_strided_run::<u8>(
+                dev, s, d, src_l, dst_offset, el_count, &info, "ucopy_u8",
+            )?,
+            _ => {
+                let mut dst_cpu = dst.to_cpu_storage()?;
+                let src_cpu = self.to_cpu_storage()?;
+                src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
+                *dst = self.device.storage_from_cpu_storage(&dst_cpu)?;
+            }
+        }
         Ok(())
     }
 
@@ -848,6 +897,53 @@ impl BackendStorage for HipStorage {
     }
 }
 
+fn copy_strided_run<T: Copy + WithDType + 'static>(
+    dev: &HipDevice,
+    src: &DeviceMemory<T>,
+    dst: &mut DeviceMemory<T>,
+    src_l: &Layout,
+    dst_offset: usize,
+    el_count: usize,
+    info: &InfoArg,
+    kernel: &str,
+) -> Result<()> {
+    let src_ptr = offset_ptr(src, src_l.start_offset());
+    let dst_ptr = unsafe { dst.as_ptr().byte_add(dst_offset * std::mem::size_of::<T>()) };
+    let func = dev.get_or_load_func(kernel, &kernels::UNARY)?;
+    let ndims = src_l.shape().rank();
+    let mut args = Args::new();
+    args.push(&el_count);
+    args.push(&ndims);
+    args.push_ptr(info.kernel_arg());
+    args.push_ptr(src_ptr);
+    args.push_ptr(dst_ptr);
+    launch1d(&func, dev.stream(), el_count, args.as_mut_slice())?;
+    Ok(())
+}
+
+fn storage_to_contiguous(s: &HipStorage, l: &Layout) -> Result<HipStorage> {
+    let dev = &s.device;
+    let el = l.shape().elem_count();
+    let slice = match &s.slice {
+        S::U8(_) => S::U8(dev.alloc_zeros::<u8>(el)?),
+        S::U32(_) => S::U32(dev.alloc_zeros::<u32>(el)?),
+        S::I16(_) => S::I16(dev.alloc_zeros::<i16>(el)?),
+        S::I32(_) => S::I32(dev.alloc_zeros::<i32>(el)?),
+        S::I64(_) => S::I64(dev.alloc_zeros::<i64>(el)?),
+        S::BF16(_) => S::BF16(dev.alloc_zeros::<bf16>(el)?),
+        S::F16(_) => S::F16(dev.alloc_zeros::<f16>(el)?),
+        S::F32(_) => S::F32(dev.alloc_zeros::<f32>(el)?),
+        S::F64(_) => S::F64(dev.alloc_zeros::<f64>(el)?),
+        S::F8E4M3(_) => S::F8E4M3(dev.alloc_zeros::<u8>(el)?),
+    };
+    let mut out = HipStorage {
+        slice,
+        device: dev.clone(),
+    };
+    s.copy_strided_src(&mut out, 0, l)?;
+    Ok(out)
+}
+
 fn conv2d_hip(
     inp: &HipStorage,
     l: &Layout,
@@ -867,12 +963,20 @@ fn conv2d_hip(
     let out_shape = Shape::from((n, oc, h_out, w_out));
     let out_el = out_shape.elem_count();
 
-    if !l.is_contiguous() || !kernel_l.is_contiguous() {
-        let inp_cpu = inp.to_cpu_storage()?;
-        let ker_cpu = kernel.to_cpu_storage()?;
-        let out = inp_cpu.conv2d(l, &ker_cpu, kernel_l, params)?;
-        return dev.storage_from_cpu_storage(&out);
-    }
+    let inp_owned;
+    let (inp, l) = if l.is_contiguous() {
+        (inp, l)
+    } else {
+        inp_owned = storage_to_contiguous(inp, l)?;
+        (&inp_owned, &Layout::contiguous(l.shape()))
+    };
+    let ker_owned;
+    let (kernel, kernel_l) = if kernel_l.is_contiguous() {
+        (kernel, kernel_l)
+    } else {
+        ker_owned = storage_to_contiguous(kernel, kernel_l)?;
+        (&ker_owned, &Layout::contiguous(kernel_l.shape()))
+    };
 
     let slice = match (&inp.slice, &kernel.slice) {
         (S::F32(input), S::F32(weight)) => S::F32(conv2d_run::<f32>(
@@ -983,12 +1087,20 @@ fn conv_transpose2d_hip(
     let out_shape = Shape::from((n, oc, h_out, w_out));
     let out_el = out_shape.elem_count();
 
-    if !l.is_contiguous() || !kernel_l.is_contiguous() {
-        let inp_cpu = inp.to_cpu_storage()?;
-        let ker_cpu = kernel.to_cpu_storage()?;
-        let out = inp_cpu.conv_transpose2d(l, &ker_cpu, kernel_l, params)?;
-        return dev.storage_from_cpu_storage(&out);
-    }
+    let inp_owned;
+    let (inp, l) = if l.is_contiguous() {
+        (inp, l)
+    } else {
+        inp_owned = storage_to_contiguous(inp, l)?;
+        (&inp_owned, &Layout::contiguous(l.shape()))
+    };
+    let ker_owned;
+    let (kernel, kernel_l) = if kernel_l.is_contiguous() {
+        (kernel, kernel_l)
+    } else {
+        ker_owned = storage_to_contiguous(kernel, kernel_l)?;
+        (&ker_owned, &Layout::contiguous(kernel_l.shape()))
+    };
 
     let slice = match (&inp.slice, &kernel.slice) {
         (S::F32(input), S::F32(weight)) => S::F32(conv_transpose2d_run::<f32>(

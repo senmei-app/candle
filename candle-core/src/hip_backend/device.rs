@@ -36,6 +36,12 @@ pub struct HipDevice {
     seed_value: Arc<RwLock<u64>>,
 }
 
+// rocm-rs handle types wrap raw pointers and don't implement Send/Sync; the
+// handles are thread-safe here because candle synchronizes before handing
+// buffers back. Mirrors the CUDA backend.
+unsafe impl Send for HipDevice {}
+unsafe impl Sync for HipDevice {}
+
 impl std::fmt::Debug for HipDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "HipDevice({:?})", self.id)
